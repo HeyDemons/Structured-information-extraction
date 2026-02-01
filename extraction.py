@@ -13,18 +13,19 @@ SYSTEM_PROMPT = '''
 ### 核心原则 (Core Principles)
 
 ## 0. 语言一致性 (Language Consistency) - HIGHEST PRIORITY
-- **原文保留**：抽取的实体名、技术术语、指标名、单位、以及 `evidence/quote` 字段，必须**严格保持论文原文语言**。
+- **原文保留**：抽取的实体名、技术术语、指标名、单位、对比算法名称、以及 `evidence/quote` 字段，必须**严格保持论文原文语言**。
 - **禁止翻译**：如果论文是英文，输出的 JSON 值（Values）必须是英文。严禁将 "Accuracy" 翻译为 "准确率"，或将算法名翻译成中文。
 - **解释性字段**：仅 `rationale` (理由) 字段允许使用中文进行解释，但引用的原文必须保持原样。
 
-## 1. 证据优先
-所有抽取结论必须尽量给出原文证据片段（quote）与其在 paper 中的定位信息。
+## 1. 证据优先 (Evidence First)
+- **所有抽取必须有原文支撑**：严禁基于"领域常识"或"合理推测"进行提取。如果论文未明确提及某项技术或应用，即使在该领域是常见的，也**不得提取**。
+- **Quote 必须精准**：evidence.quote 必须是论文中的原句或连续短语，不得改写或概括。
 
-## 2. 数值严谨与计算
-结果抽取必须抓取具体数值。
-**必须计算 P_score**：针对每一项有明确 Baseline 对比的指标，执行公式计算：
-$$P_{score} = (Result_{paper} - Result_{baseline}) / Result_{baseline}$$
-(确保在计算前统一单位，计算结果保留 4 位小数)
+## 2. 数据精确性 (Precision of Data) - CRITICAL
+- **Value 必须是量化数据**：严禁在 `value` 字段填写 "improved", "high", "low", "faster" 等形容词。必须提取具体的数字（如 "95.4", "15%"）。如果原文只提到"性能提升"但未给出具体数字，**请勿**将其作为一条 Metric 提取。
+- **Unit 必须明确**：如 "%", "ms", "FPS", "Joules"。
+- **条件必须完整**：experimental_setting 必须包含供电电压、负载条件、温度、频率等关键参数（如 "4.2V supply, 8Ω load, -60dBFS input"）。
+- **禁止虚构对比**：`comparison_methods` 仅在原文明确列出对比算法的具体数值时填写。如果原文仅说 "outperforms state-of-the-art" 但没列出具体算法和数值，该列表必须为 `[]`。
 
 ## 3. TRL 评估 (精确分级)
 请严格对照以下定义表，根据论文中的**数据来源、测试环境、系统状态**证据，判断该技术目前所处的**最高具体等级**（TRL 1 至 TRL 9）。
@@ -47,12 +48,24 @@ $$P_{score} = (Result_{paper} - Result_{baseline}) / Result_{baseline}$$
 **判定原则：**
 1. 若证据处于两个等级之间，选择**较低**的那个等级。
 2. 必须在 `rationale` 中明确指出判定依据。
+
+## 4. 应用场景严格性 (Strictness in Application) 
+- **禁止过度推断**：仅提取论文**明确提及**的应用场景（如论文提到 "battery-powered devices" 则提取，不得自行推断 "industrial applications" 除非原文明确提及）。
+- **时间维度划分**：若论文未明确区分近/中/远期，可根据技术成熟度合理推断，但必须在 evidence 中注明是基于哪句原文的合理延伸。
+
+## 5. P_score 专利-权益要求评分
+- **P1 边缘性改进**：针对局部问题的小改动，不触及核心逻辑。关键词：外观优化、偶发问题、易替代。
+- **P2 常规性优化**：沿用已知技术路线，做稳步性能提升，未改变架构。
+- **P3 核心瓶颈突破**：解决行业共性痛点，指标显著改善（如功耗下降 ≥20%），触及核心逻辑。
+- **P4 系统性创新**：提出系统级新方案，具备强技术壁垒，可支撑完整国产可控链条。
+- **P5 颠覆式/引领性**：开辟全新技术赛道，成为行业基准或打破封锁。
+输出 `p_score`（1-5）并在 `p_reason` 中用中文简述依据与对应关键特征。
 '''
 
 PROMPT_TEMPLATE = """
-给定论文（Markdown 全文），请从中抽取核心元数据。
+给定论文（Markdown 全文），请从中抽取核心元数据并按指定 JSON 格式输出。
 
-**重要提示：如果论文是英文，所有抽取的字段值（尤其是 object, metric_name, innovation）必须保持英文，不要翻译成中文。**
+**重要提示：如果论文是英文，所有抽取的字段值（尤其是 object, metric_name, innovation, comparison_methods）必须保持英文，不要翻译成中文。**
 
 ---
 
@@ -65,37 +78,49 @@ PROMPT_TEMPLATE = """
 ## 抽取要求
 
 A. 问题抽取（problem）
-1) 研究对象（object）：**(Keep Original Language)** 系统 / 算法对象是什么？
-2) 应用场景（scenario）：面向什么行业？
-3) 约束条件（constraints）：关注数据隐私、实时性、成本等。
+1) **研究对象 (object)**：系统/算法对象是什么？**(Keep Original Language)**
+2) **应用场景 (scenario)**：面向什么具体行业或场景？
+3) **约束条件 (constraints)**：关注数据隐私、实时性、算力成本、硬件限制等。
+4) **关键难题 (key_questions)**：该行业痛点是什么？为什么这个问题在产业界很重要？
 
 B. 方法抽取（method）
-- 技术路线与创新点 (technical_route / innovations)
-- **保持术语原文**，不要翻译专有名词。
+1) **技术路线 (technical_route)**：主要步骤或架构。
+2) **创新点 (innovations)**：核心贡献。**(Keep Original Terms)**
+3) **假设与依赖 (assumptions_or_dependencies)**：算法运行依赖什么假设？（如：假设光照均匀、假设拥有标注数据等）。
 
-C. 结果抽取（results）
-- metric_name **(Keep Original English)**
-- value / unit
-- condition **(Data source must be specific, e.g., "COCO dataset" or "Real-world factory data")**
-
-**计算规则：**
-1. 找到 $Result_{paper}$ 和 $Result_{baseline}$。
-2. 计算：$$P_{score} = (Result_{paper} - Result_{baseline}) / Result_{baseline}$$
-3. 若无 Baseline，p_score 填 null。
+C. 结果抽取（results_extract）
+**注意：结果需要按层级结构提取，严禁扁平化处理。**
+1) **Proposed Methods**：论文提出的主要方法/模型/芯片名称。
+2) **Experiment Results**：针对该方法进行的具体实验任务（Task）或场景（Scenario）。
+3) **Metrics**：
+    - **Metric Name**：指标名称（如 "Accuracy", "Latency"）。
+    - **Value & Unit**：**必须提取具体的数字**（如 "0.45", "120"）。**如果原文是定性描述（如 "significantly improved"）且无具体数字支持，请不要提取该指标。**
+    - **Condition/Setting**：数据来源必须具体（如 "COCO dataset" 或 "Real-world factory data"）。
+    - **Comparison Methods**：
+        - 仅提取原文中明确列出**具体数值**的对比方法（Baseline）。
+        - 如果没有具体的对比数值，**保持该数组为空 []**。
+        - **必须验证**：comparison_methods 中的每个方法是否都有原文明确的具体数值？
+        - **禁止**：使用 "Previous work" 或 "Baseline" 作为 method_name，除非原文图表确实如此标记。
+        - **格式**：method_name 应包含年份和参考文献编号（如 "ISSCC'22 [6]"），如果原文如此标注。
 
 D. 应用场景（application）
-- near_term / mid_term / long_term
+- 从原文内容中提取出技术的近期、中期、远期应用方向。
+- **Evidence**：必须给出具体的原文引用。
 
 E. 技术就绪度（TRL）
 **核心任务：给出具体的 TRL 等级 (1-9)**
-- level："TRL 1" | ... | "TRL 9"
-- rationale：引用原文解释判定依据（数据来源、环境）。**Rationale 可以用中文，但 Evidence 必须是原文。**
+- **Level**："TRL 1" | ... | "TRL 9"
+- **Rationale**：引用原文解释判定依据（数据来源、环境）。**Rationale 可以用中文，但 Evidence 必须是原文。**
+- **Uncertain**：如果证据不足以确信等级，设为 true。
+
+F. 专利-权益要求评分（P_score）
+- 根据系统提示中的 P_score 表，输出一个 `p_score`（P1-P5）以及 `p_reason`（中文说明，引用关键依据）。
 
 ## JSON 输出结构
 
+```json
 {
-  "paper_id": "",
-  "title": "",
+  "paper_title": "",
   "domain": "",
   "language": "",  // "en" or "zh"
   "problem": {
@@ -113,21 +138,26 @@ E. 技术就绪度（TRL）
     "innovations": [{"point": "", "category": "", "evidence": {"section": "", "quote": ""}}],
     "assumptions_or_dependencies": [{"item": "", "evidence": {"section": "", "quote": ""}}]
   },
-  "results": {
-    "items": [
-      {
-        "metric_name": "",        // Must be Original Text 
-        "paper_value": "",        // Number 论文方法的数值(数字类型)
-        "baseline_value": "",     // Number or null
-        "unit": "",
-        "p_score": null,          // Number (4 decimal places)
-        "baseline_name": "",      // Original Text 对比的算法/系统名称
-        "condition": "",          // Original Text 数据集/实验设置
-        "significance": "",       // p值等
-        "evidence": {"section": "", "quote": ""}
-      }
-    ],
-    "results_kv": {}
+  "results_extract": {
+    "proposed_methods": [{
+        "method_name": "",
+        "experiment_results": [{
+            "task_or_scenario": "",
+            "metrics": [{
+                "metric_name": "",
+                "value": "", // Must be a number or specific quantitative string. NO adjectives like "improved".
+                "unit": "",
+                "experimental_setting": "",
+                "evidence": {"section": "", "quote": ""},
+                "comparison_methods": [{ // Keep empty [] if no specific numerical comparison exists
+                    "method_name": "",
+                    "value": "", // Must be a specific number
+                    "experimental_setting": "",
+                    "evidence": {"section": "", "quote": ""}
+                }]
+            }]
+        }]
+    }]
   },
   "application": {
     "near_term": [{"direction": "", "evidence": {"section": "", "quote": ""}}],
@@ -138,16 +168,18 @@ E. 技术就绪度（TRL）
     "level": "",
     "rationale": "",
     "evidence": [{"section": "", "quote": ""}],
-    "uncertain": true
-  }
+    "uncertain": "" // "true" or "false"
+  },
+  "p_score": "",
+  "p_reason": ""
 }
-
+```
 ## 补充规则
 - 最终仅输出 JSON，不得输出任何说明文本。
+- 确保 JSON 格式合法，确保没有尾部逗号错误，反斜杠转义错误等问题。
+- Value 字段检查：如果提取到的 value 是非数字的形容词，请直接丢弃该字段。
 """
 
-
-os.environ['DEEPSEEK_API_KEY'] = 'sk-feee15f8635f42db849c9137ec48d961'
 
 class DeepSeekAgent:
     def __init__(self, api_key: str, model: str = "deepseek-reasoner") -> None:
@@ -201,8 +233,8 @@ def main() -> None:
         raise EnvironmentError("请设置环境变量 DEEPSEEK_API_KEY")
 
     base_dir = Path(__file__).resolve().parent
-    md_dir = base_dir 
-    results_dir = base_dir / "extraction_results" / "1-24"
+    md_dir = base_dir / "md" / "1.26" / "filtered"
+    results_dir = base_dir / "extraction_results" / "1-26"
     results_dir.mkdir(exist_ok=True)
     
     if not md_dir.exists():

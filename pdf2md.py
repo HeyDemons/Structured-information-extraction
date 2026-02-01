@@ -292,8 +292,9 @@ def parse_doc(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="MinerU demo parser")
     __dir__ = os.path.dirname(os.path.abspath(__file__))
-    default_input_dir = os.getenv("MINERU_INPUT_DIR", os.path.join(__dir__, "pdfs"))
-    default_output_dir = os.getenv("MINERU_OUTPUT_DIR", os.path.join(__dir__, "output"))
+    basedir = Path(__dir__).resolve()
+    default_input_dir = basedir / "pdf/1.26"
+    default_output_dir = basedir / "md/1.26"
     parser.add_argument(
         "--input-dir",
         type=str,

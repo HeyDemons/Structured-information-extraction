@@ -8,35 +8,11 @@ from typing import Dict, List, Tuple
 import httpx
 
 
-def split_text_smart(text: str, max_chunk_size=2000) -> List[str]:
+def split_text_smart(text: str, max_chunk_size=1000) -> List[str]:
     """
-    按段落智能切分，尽量保持语义完整性。
-    提高上限，减少表格/图注与上下文被拆散。
+    仅按段落（两个换行符）切分文本，逐段返回。
     """
-    paragraphs = text.split('\n\n')
-    chunks = []
-    current_chunk = []
-    current_len = 0
-
-    for para in paragraphs:
-        para_len = len(para)
-        if para_len > max_chunk_size:
-            if current_chunk:
-                chunks.append("\n\n".join(current_chunk))
-                current_chunk = []
-                current_len = 0
-            chunks.append(para)
-        elif current_len + para_len < max_chunk_size:
-            current_chunk.append(para)
-            current_len += para_len
-        else:
-            chunks.append("\n\n".join(current_chunk))
-            current_chunk = [para]
-            current_len = para_len
-
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
-    return chunks
+    return [para for para in text.split("\n\n") if para.strip()]
 
 
 def contains_markdown_table(text: str) -> bool:
@@ -108,7 +84,7 @@ def call_llm(prompt: str) -> Dict[str, str]:
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": "qwen-plus",
+                "model": "deepseek-v3.2",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.01,
             },
@@ -134,29 +110,49 @@ def semantic_filter_paper(markdown_text: str) -> Tuple[str, str]:
 
     # 双语且覆盖抽取要件的提示词
     SCREENER_PROMPT = """
-任务/Task: 判断以下文本块是否包含【结构化信息抽取】所需的有效数据。
-Decide if the chunk contains information needed for structured extraction.
+    任务/Task: 这里的文本块来自一篇学术/技术论文。请判断该文本块是否包含用于【下游结构化抽取】的有价值信息。
+    Decide if the chunk contains valuable information for downstream structured extraction (Problem, Method, Results, TRL).
 
-【必须丢弃 / DROP】：
-- 参考文献/致谢/基金/版权/利益冲突/作者信息/附录/补充材料 (References/Bibliography, Acknowledgements, Funding, Copyright,
-  Conflict of Interest, Author Contributions, Appendix, Supplementary)。
-- 纯目录、纯公式列表（无实验指标/条件）。
+    ### 判别标准 (Criteria)
 
-【必须保留 / KEEP】：
-- 论文标题（Paper Title），即使仅为概括性描述，也必须保留。
-- 含具体实验数据或单位数值（如 "accuracy 95%", "power 4 mW"）。
-- Baseline/对比描述（"baseline", "vs.", "compared with", “对比/基线”）。
-- 数据集与实验设置/测试环境（"COCO", "ImageNet", "real factory data", "measurement setup"）。
-- 硬件/流片/现场系统演示/产线/批量测试等 TRL 证据（"silicon", "tape-out", "field trial", “流片/产线/现场演示/批量测试”）。
-- 方法/工艺/系统架构；图表与图注（Markdown/HTML Tables, Figure Captions）。
-- Abstract/Introduction/Results/Conclusion/Discussion/Future Work/Prospects/Limitations（即使无新指标也要保留）。
+    【必须丢弃 / DROP】 (Pure Noise):
+    - **参考文献列表** (References/Bibliography)。
+    - **作者/作者单位信息** (Author names, affiliations, emails)。
+    - **致谢/版权/基金/作者简介** (Acknowledgements, Funding, Copyright, Author Bios, Contact Info)。
+    - **纯粹的页眉/页脚/页码** (Repeated headers/footers, page numbers)。
+    - **目录/附录索引** (Table of Contents, Appendix Index)。
+    - **利益冲突声明** (Conflict of Interest)。
+    - **无意义的文本碎片** (Gibberish, random symbols)。例如：'(a)'。
+    
+    【必须保留 / KEEP】 (Valuable Signal):
+    请检查文本是否包含以下任一维度的信息：
 
-Input Chunk:
-{text_chunk}
+    1. **核心元数据**: 论文标题 (Paper Title)、摘要 (Abstract)。
+    2. **问题背景 (Problem & Constraints)**:
+    - 行业痛点/关键难题 (pain points, "key challenges")。
+    - 约束条件描述 (constraints: 隐私, 实时性, 成本, 功耗等文字描述)。
+    - 应用场景定义 (scenario, industry application)。
+    3. **方法论 (Methodology)**:
+    - 算法/系统架构描述 (System architecture, pipeline)。
+    - 核心创新点声明 (Innovations, contributions)。
+    - 假设与依赖条件 (Assumptions, dependencies)。
+    4. **定量结果 (Quantitative Results)**:
+    - **任何**数字指标、单位、性能数值 (metrics, values, units)。
+    - 对比实验、Baseline 提及 (Comparison, SOTA, "outperforms").
+    - 图表标题或图注 (Figure captions, Table headers)。
+    5. **TRL 关键证据 (TRL Evidence)**:
+    - 测试环境描述 (Testbed, "real-world", "simulation").
+    - 硬件/落地关键词 ("FPGA", "chip", "deployment", "mass production", "field trial").
+    6. **未来展望 (Application)**:
+    - 结论与未来工作 (Conclusion, Future work, Limitations)。
 
-请仅输出 JSON / Output JSON only:
-{{"decision": "KEEP" | "DROP", "reason": "..."}}
-    """.strip()
+
+    Input Chunk:
+    {text_chunk}
+
+    请仅输出 JSON / Output JSON only:
+    {{"decision": "KEEP" | "DROP", "reason": "Briefly explain why (e.g., 'Contains metrics', 'Describes method', 'Reference list')"}}
+    """
 
     kept_chunks = []
     dropped_chunks = []
@@ -199,13 +195,25 @@ Input Chunk:
 
     return final_text, removed_text
 
-markdown_file_path = Path("output-1-23/md/3.1_A_121.3dB-DR_115dB-PSNR_Digital-Input_Capacitive-Feedback_Class-D_Audio_Amplifier_with_Double-Sided_Voltage-Boosting_DSVB_Modulation.md")
-markdown_text = markdown_file_path.read_text(encoding="utf-8")
-semantic_text, removed_text = semantic_filter_paper(markdown_text)
-with open("semantic_filtered_output.md", "w", encoding="utf-8") as f:
-    f.write(semantic_text)
-if removed_text.strip():
-    with open("semantic_filtered_removed.md", "w", encoding="utf-8") as f:
-        f.write(removed_text)
-    print("=== Removed Section ===")
-    print(removed_text.strip())
+def process_markdown_directory(directory: Path) -> None:
+    directory = directory.expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError(f"Markdown directory not found: {directory}")
+
+    filtered_root = directory.parent / "filtered"
+    filtered_root.mkdir(parents=True, exist_ok=True)
+
+    for md_file in sorted(directory.rglob("*.md")):
+        rel_path = md_file.relative_to(directory)
+        target_path = filtered_root / rel_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        markdown_text = md_file.read_text(encoding="utf-8")
+        semantic_text, _ = semantic_filter_paper(markdown_text)
+
+        target_path.write_text(semantic_text, encoding="utf-8")
+        print(f"[filtered] {md_file} -> {target_path}")
+
+if __name__ == "__main__":
+    target_dir = Path(os.environ.get("FILTER_MD_DIR", "md/1.26/md"))
+    process_markdown_directory(target_dir)
